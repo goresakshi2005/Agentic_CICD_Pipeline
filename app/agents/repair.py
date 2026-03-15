@@ -4,7 +4,7 @@ from app.config import GEMINI_API_KEY
 from app.github_client import get_file_content, create_branch, update_file, create_pull_request
 import json
 
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=GEMINI_API_KEY, temperature=0.2)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY, temperature=0.2)
 
 repair_prompt = PromptTemplate(
     input_variables=["root_cause", "fix_type", "details", "repo_files"],
