@@ -1,0 +1,571 @@
+Directory structure:
+└── agentic-cicd/
+    ├── README.md
+    ├── requirements.txt
+    ├── app/
+    │   ├── __init__.py
+    │   ├── config.py
+    │   ├── github_client.py
+    │   ├── knowledge_base.py
+    │   ├── main.py
+    │   ├── models.py
+    │   ├── utils.py
+    │   └── agents/
+    │       ├── __init__.py
+    │       ├── diagnosis.py
+    │       ├── governance.py
+    │       ├── monitor.py
+    │       ├── orchestrator.py
+    │       └── repair.py
+    └── .github/
+        └── workflows/
+            └── ci.yaml
+
+================================================
+FILE: README.md
+================================================
+
+
+
+================================================
+FILE: requirements.txt
+================================================
+fastapi
+uvicorn
+python-dotenv
+httpx
+langchain
+langchain-google-genai
+faiss-cpu
+pydantic
+python-multipart
+pytest
+
+
+================================================
+FILE: app/__init__.py
+================================================
+
+
+
+================================================
+FILE: app/config.py
+================================================
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GITHUB_REPO = os.getenv("GITHUB_REPO")  # format: owner/repo
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+
+================================================
+FILE: app/github_client.py
+================================================
+import httpx
+from typing import Optional, Dict, Any, List
+from app.config import GITHUB_TOKEN, GITHUB_REPO
+
+GITHUB_API_BASE = "https://api.github.com"
+HEADERS = {
+    "Authorization": f"token {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github.v3+json"
+}
+
+async def get_workflow_run(run_id: int) -> Optional[Dict[str, Any]]:
+    """Get details of a workflow run."""
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/runs/{run_id}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=HEADERS)
+        if resp.status_code == 200:
+            return resp.json()
+    return None
+
+async def get_workflow_logs(run_id: int) -> Optional[str]:
+    """Get logs of a workflow run (as text)."""
+    # First, get the download URL for logs
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/runs/{run_id}/logs"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=HEADERS, follow_redirects=True)
+        if resp.status_code == 200:
+            return resp.text
+    return None
+
+async def get_commit_details(commit_sha: str) -> Optional[Dict[str, Any]]:
+    """Get commit details including diff and message."""
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/commits/{commit_sha}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=HEADERS)
+        if resp.status_code == 200:
+            return resp.json()
+    return None
+
+async def create_pull_request(title: str, body: str, head: str, base: str = "main") -> Optional[Dict[str, Any]]:
+    """Create a pull request."""
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/pulls"
+    data = {
+        "title": title,
+        "body": body,
+        "head": head,
+        "base": base
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, json=data, headers=HEADERS)
+        if resp.status_code == 201:
+            return resp.json()
+    return None
+
+async def get_file_content(path: str, ref: str = "main") -> Optional[str]:
+    """Get content of a file from repo."""
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/contents/{path}?ref={ref}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=HEADERS)
+        if resp.status_code == 200:
+            data = resp.json()
+            import base64
+            return base64.b64decode(data["content"]).decode("utf-8")
+    return None
+
+async def create_branch(branch_name: str, from_branch: str = "main") -> bool:
+    """Create a new branch from the base branch."""
+    # Get the SHA of the base branch
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/git/ref/heads/{from_branch}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=HEADERS)
+        if resp.status_code != 200:
+            return False
+        sha = resp.json()["object"]["sha"]
+
+    # Create new branch
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/git/refs"
+    data = {
+        "ref": f"refs/heads/{branch_name}",
+        "sha": sha
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, json=data, headers=HEADERS)
+        return resp.status_code == 201
+
+async def update_file(path: str, content: str, commit_message: str, branch: str) -> bool:
+    """Update a file on a given branch (creates commit)."""
+    # First, get the current file's SHA (if exists)
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/contents/{path}?ref={branch}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=HEADERS)
+        sha = None
+        if resp.status_code == 200:
+            sha = resp.json()["sha"]
+
+    import base64
+    content_bytes = content.encode("utf-8")
+    content_b64 = base64.b64encode(content_bytes).decode("utf-8")
+
+    data = {
+        "message": commit_message,
+        "content": content_b64,
+        "branch": branch
+    }
+    if sha:
+        data["sha"] = sha
+
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/contents/{path}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.put(url, json=data, headers=HEADERS)
+        return resp.status_code in (200, 201)
+
+
+================================================
+FILE: app/knowledge_base.py
+================================================
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.schema import Document
+from app.config import GEMINI_API_KEY
+import os
+
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
+
+VECTOR_STORE_PATH = "faiss_index"
+
+def get_vector_store():
+    if os.path.exists(VECTOR_STORE_PATH):
+        return FAISS.load_local(VECTOR_STORE_PATH, embeddings)
+    else:
+        return FAISS.from_texts(["initial"], embeddings)  # placeholder
+
+def add_to_knowledge_base(problem: str, solution: str):
+    vectorstore = get_vector_store()
+    doc = Document(page_content=f"Problem: {problem}\nSolution: {solution}", metadata={})
+    vectorstore.add_documents([doc])
+    vectorstore.save_local(VECTOR_STORE_PATH)
+
+def search_similar_problems(problem: str, k: int = 3):
+    vectorstore = get_vector_store()
+    results = vectorstore.similarity_search(problem, k=k)
+    return [doc.page_content for doc in results]
+
+
+================================================
+FILE: app/main.py
+================================================
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from app import github_client
+from app.agents import monitor, diagnosis, repair, governance, orchestrator
+from app.models import WebhookPayload, ApprovalRequest
+import logging
+import time
+
+app = FastAPI()
+logger = logging.getLogger(__name__)
+
+@app.post("/webhook")
+async def github_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Receive GitHub webhook for workflow_run events."""
+    payload = await request.json()
+    # Verify signature if secret set (optional, skipped for brevity)
+    event = request.headers.get("X-GitHub-Event")
+    if event != "workflow_run":
+        return {"status": "ignored"}
+
+    run_data = payload.get("workflow_run")
+    if not run_data:
+        raise HTTPException(400, "Invalid payload")
+
+    # Only handle completed failures
+    if run_data.get("status") != "completed" or run_data.get("conclusion") != "failure":
+        return {"status": "ignored"}
+
+    # Pass to background processing
+    background_tasks.add_task(process_failed_run, run_data)
+    return {"status": "processing"}
+
+async def process_failed_run(run_data: dict):
+    run_id = run_data["id"]
+    head_commit = run_data.get("head_commit", {})
+    commit_sha = head_commit.get("id") or run_data.get("head_sha")
+    if not commit_sha:
+        logger.error("No commit SHA found")
+        return
+
+    logger.info(f"Processing failed run {run_id}")
+
+    # 1. Get logs
+    logs = await github_client.get_workflow_logs(run_id)
+    if not logs:
+        logger.error("Could not fetch logs")
+        return
+
+    # 2. Diagnose
+    diag = await diagnosis.diagnose_failure(run_id, commit_sha, logs)
+    logger.info(f"Diagnosis: {diag}")
+
+    # 3. Generate fix
+    fix_plan = await repair.generate_fix(diag)
+    logger.info(f"Fix plan: {fix_plan}")
+
+    # 4. Check if human approval needed
+    if await governance.requires_human_approval(diag, run_data):
+        # Store for approval
+        governance.store_pending_approval(run_id, diag, fix_plan)
+        # Notify human (e.g., via webhook, email). We'll expose an endpoint for approval.
+        logger.info(f"Waiting for approval for run {run_id}")
+        # You could send Slack message here
+    else:
+        # Apply fix automatically
+        pr_url = await repair.apply_fix(fix_plan)
+        if pr_url:
+            logger.info(f"Created PR: {pr_url}")
+            # Optionally, after PR merge, auto-deploy? We'll keep simple.
+        else:
+            logger.info("No changes applied or fix failed.")
+
+@app.post("/approve")
+async def approve_action(req: ApprovalRequest):
+    """Human approval endpoint."""
+    run_id = req.run_id
+    approved = req.approved
+    pending = governance.get_pending_approval(run_id)
+    if not pending:
+        raise HTTPException(404, "No pending approval for this run")
+
+    diag, fix_plan = pending
+    if approved:
+        # Apply fix
+        pr_url = await repair.apply_fix(fix_plan)
+        if pr_url:
+            # Optionally, if this is a deployment, we could trigger after PR merge
+            # For now, just return
+            governance.remove_pending_approval(run_id)
+            return {"status": "approved", "pr_url": pr_url}
+        else:
+            return {"status": "fix_failed"}
+    else:
+        governance.remove_pending_approval(run_id)
+        return {"status": "rejected"}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+================================================
+FILE: app/models.py
+================================================
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+
+class WebhookPayload(BaseModel):
+    action: str
+    workflow_run: Optional[Dict[str, Any]]
+    repository: Optional[Dict[str, Any]]
+    sender: Optional[Dict[str, Any]]
+
+class ApprovalRequest(BaseModel):
+    run_id: int
+    approved: bool
+    user: str
+
+
+================================================
+FILE: app/utils.py
+================================================
+
+
+
+================================================
+FILE: app/agents/__init__.py
+================================================
+
+
+
+================================================
+FILE: app/agents/diagnosis.py
+================================================
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.prompts import PromptTemplate
+from langchain.schema import HumanMessage
+from app.config import GEMINI_API_KEY
+from app.knowledge_base import search_similar_problems
+import json
+
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=GEMINI_API_KEY, temperature=0)
+
+diagnosis_prompt = PromptTemplate(
+    input_variables=["logs", "commit_message", "diff", "similar_issues"],
+    template="""
+You are a DevOps expert. Analyze the CI/CD pipeline failure logs and the related commit to diagnose the root cause.
+
+Commit Message:
+{commit_message}
+
+Commit Diff (files changed):
+{diff}
+
+Pipeline Logs (last 100 lines):
+{logs}
+
+Similar past issues and solutions:
+{similar_issues}
+
+Provide a JSON output with:
+- "root_cause": a concise description of the problem
+- "confidence": a number between 0 and 1
+- "suggested_fix_type": one of ["dependency", "test_failure", "syntax_error", "config_error", "other"]
+- "details": any extra details
+"""
+)
+
+async def diagnose_failure(run_id: int, commit_sha: str, logs: str) -> dict:
+    # Get commit details
+    from app.github_client import get_commit_details
+    commit_data = await get_commit_details(commit_sha)
+    commit_message = commit_data.get("commit", {}).get("message", "")
+    # Get diff (simplified: we can get files changed)
+    files = commit_data.get("files", [])
+    diff_text = "\n".join([f"{f['filename']}: {f['status']}" for f in files])
+
+    # Search knowledge base for similar issues
+    similar = search_similar_problems(logs[:500])  # use first 500 chars as query
+    similar_text = "\n".join(similar) if similar else "No similar past issues."
+
+    prompt = diagnosis_prompt.format(
+        logs=logs[-2000:],  # last 2000 chars
+        commit_message=commit_message,
+        diff=diff_text,
+        similar_issues=similar_text
+    )
+    response = llm.invoke([HumanMessage(content=prompt)])
+    # Expect JSON response
+    try:
+        result = json.loads(response.content)
+    except:
+        # Fallback
+        result = {"root_cause": "Unknown", "confidence": 0.5, "suggested_fix_type": "other", "details": response.content}
+    return result
+
+
+================================================
+FILE: app/agents/governance.py
+================================================
+async def requires_human_approval(diagnosis: dict, run_data: dict) -> bool:
+    """Determine if the fix/deployment requires human approval."""
+    # Example: if deployment to production or high-risk change
+    # For simplicity, always require approval for now, but could use diagnosis confidence, etc.
+    return True
+
+# We'll handle approval via an API endpoint that stores pending approvals.
+# For now, we'll have a simple in-memory store.
+pending_approvals = {}  # run_id -> (diagnosis, fix_plan)
+
+def store_pending_approval(run_id: int, diagnosis: dict, fix_plan: dict):
+    pending_approvals[run_id] = (diagnosis, fix_plan)
+
+def get_pending_approval(run_id: int):
+    return pending_approvals.get(run_id)
+
+def remove_pending_approval(run_id: int):
+    pending_approvals.pop(run_id, None)
+
+
+================================================
+FILE: app/agents/monitor.py
+================================================
+async def monitor_workflow(run_data: dict) -> bool:
+    """Return True if workflow failed."""
+    conclusion = run_data.get("conclusion")
+    status = run_data.get("status")
+    # If conclusion is 'failure' or status is 'completed' with conclusion 'failure'
+    if status == "completed" and conclusion == "failure":
+        return True
+    return False
+
+
+================================================
+FILE: app/agents/orchestrator.py
+================================================
+from app.github_client import GITHUB_REPO, HEADERS
+import httpx
+
+async def trigger_deployment(environment: str = "production"):
+    """Trigger a deployment workflow (assumes a workflow_dispatch event)."""
+    # This depends on your setup; we'll assume there's a deploy.yml with workflow_dispatch
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/deploy.yml/dispatches"
+    data = {
+        "ref": "main",
+        "inputs": {
+            "environment": environment
+        }
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, json=data, headers=HEADERS)
+        return resp.status_code == 204
+
+
+================================================
+FILE: app/agents/repair.py
+================================================
+from langchain.prompts import PromptTemplate
+from langchain.schema import HumanMessage
+from app.config import GEMINI_API_KEY
+from app.github_client import get_file_content, create_branch, update_file, create_pull_request
+import json
+
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY, temperature=0.2)
+
+repair_prompt = PromptTemplate(
+    input_variables=["root_cause", "fix_type", "details", "repo_files"],
+    template="""
+Based on the diagnosis, generate a fix.
+
+Root Cause: {root_cause}
+Fix Type: {fix_type}
+Details: {details}
+
+Current repository files (relevant ones):
+{repo_files}
+
+You need to propose changes to fix the pipeline. Provide a JSON output with:
+- "files_to_change": a list of objects, each with "path" and "new_content" (full file content after change)
+- "commit_message": a descriptive commit message for the fix
+- "pr_title": title for the pull request
+- "pr_body": description of the fix
+
+If no file changes are needed (e.g., just retry), set files_to_change empty.
+"""
+)
+
+async def generate_fix(diagnosis: dict) -> dict:
+    # Fetch relevant files (we might need to know which files to fetch; for simplicity, fetch common ones like requirements.txt, Dockerfile, etc.)
+    common_files = ["requirements.txt", "setup.py", "Dockerfile", ".github/workflows/ci.yml"]
+    repo_files_content = {}
+    for file in common_files:
+        content = await get_file_content(file)
+        if content:
+            repo_files_content[file] = content
+
+    prompt = repair_prompt.format(
+        root_cause=diagnosis["root_cause"],
+        fix_type=diagnosis["suggested_fix_type"],
+        details=diagnosis.get("details", ""),
+        repo_files=json.dumps(repo_files_content, indent=2)
+    )
+    response = llm.invoke([HumanMessage(content=prompt)])
+    try:
+        fix_plan = json.loads(response.content)
+    except:
+        fix_plan = {"files_to_change": [], "commit_message": "Auto-fix", "pr_title": "Auto-fix pipeline", "pr_body": response.content}
+    return fix_plan
+
+async def apply_fix(fix_plan: dict, base_branch: str = "main") -> Optional[str]:
+    """Create a branch, apply changes, and create PR. Returns PR URL if created."""
+    if not fix_plan.get("files_to_change"):
+        return None
+
+    branch_name = f"auto-fix-{int(time.time())}"
+    success = await create_branch(branch_name, base_branch)
+    if not success:
+        return None
+
+    for file_change in fix_plan["files_to_change"]:
+        path = file_change["path"]
+        new_content = file_change["new_content"]
+        await update_file(path, new_content, fix_plan["commit_message"], branch_name)
+
+    # Create PR
+    pr = await create_pull_request(
+        title=fix_plan["pr_title"],
+        body=fix_plan["pr_body"],
+        head=branch_name,
+        base=base_branch
+    )
+    if pr:
+        return pr["html_url"]
+    return None
+
+
+================================================
+FILE: .github/workflows/ci.yaml
+================================================
+name: CI
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      - name: Run tests
+        run: |
+          pytest
+

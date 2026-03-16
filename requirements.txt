@@ -7,4 +7,9 @@ langchain-google-genai
 faiss-cpu
 pydantic
 python-multipart
+sqlalchemy
+alembic
+slack-sdk
+junitparser
+safety  # optional security scanning
 pytest

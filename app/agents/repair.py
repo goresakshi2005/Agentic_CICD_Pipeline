@@ -1,13 +1,17 @@
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
 from langchain.schema import HumanMessage
 from app.config import GEMINI_API_KEY
 from app.github_client import get_file_content, create_branch, update_file, create_pull_request
+from app.knowledge_base import add_fix_to_knowledge
 import json
+import time
+from typing import Optional
 
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY, temperature=0.2)
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=GEMINI_API_KEY, temperature=0.2)
 
 repair_prompt = PromptTemplate(
-    input_variables=["root_cause", "fix_type", "details", "repo_files"],
+    input_variables=["root_cause", "fix_type", "details", "repo_files", "past_fixes"],
     template="""
 Based on the diagnosis, generate a fix.
 
@@ -15,21 +19,23 @@ Root Cause: {root_cause}
 Fix Type: {fix_type}
 Details: {details}
 
-Current repository files (relevant ones):
+Current relevant files:
 {repo_files}
 
-You need to propose changes to fix the pipeline. Provide a JSON output with:
-- "files_to_change": a list of objects, each with "path" and "new_content" (full file content after change)
-- "commit_message": a descriptive commit message for the fix
-- "pr_title": title for the pull request
-- "pr_body": description of the fix
+Similar past fixes:
+{past_fixes}
 
-If no file changes are needed (e.g., just retry), set files_to_change empty.
+Propose a fix. Output JSON:
+- "files_to_change": list of {"path": str, "new_content": str}
+- "commit_message": str
+- "pr_title": str
+- "pr_body": str
+- "retry": boolean (if fix is just to rerun pipeline)
+- "strategy": one of ["file_update", "retry", "rollback", "other"]
 """
 )
 
 async def generate_fix(diagnosis: dict) -> dict:
-    # Fetch relevant files (we might need to know which files to fetch; for simplicity, fetch common ones like requirements.txt, Dockerfile, etc.)
     common_files = ["requirements.txt", "setup.py", "Dockerfile", ".github/workflows/ci.yml"]
     repo_files_content = {}
     for file in common_files:
@@ -37,21 +43,32 @@ async def generate_fix(diagnosis: dict) -> dict:
         if content:
             repo_files_content[file] = content
 
+    # Get similar past fixes from knowledge base (text)
+    past = search_similar_problems(diagnosis["root_cause"])
+    past_fixes = "\n".join(past) if past else "No past fixes."
+
     prompt = repair_prompt.format(
         root_cause=diagnosis["root_cause"],
         fix_type=diagnosis["suggested_fix_type"],
         details=diagnosis.get("details", ""),
-        repo_files=json.dumps(repo_files_content, indent=2)
+        repo_files=json.dumps(repo_files_content, indent=2),
+        past_fixes=past_fixes
     )
     response = llm.invoke([HumanMessage(content=prompt)])
     try:
         fix_plan = json.loads(response.content)
     except:
-        fix_plan = {"files_to_change": [], "commit_message": "Auto-fix", "pr_title": "Auto-fix pipeline", "pr_body": response.content}
+        fix_plan = {"files_to_change": [], "commit_message": "Auto-fix", "pr_title": "Auto-fix pipeline", "pr_body": response.content, "retry": False, "strategy": "other"}
     return fix_plan
 
 async def apply_fix(fix_plan: dict, base_branch: str = "main") -> Optional[str]:
-    """Create a branch, apply changes, and create PR. Returns PR URL if created."""
+    if fix_plan.get("retry"):
+        # Just trigger a new run (maybe via workflow_dispatch)
+        # We'll need to know the workflow ID; for simplicity, assume it's the same.
+        from app.github_client import trigger_workflow_dispatch
+        success = await trigger_workflow_dispatch("ci.yml", ref=base_branch)
+        return "retry_triggered" if success else None
+
     if not fix_plan.get("files_to_change"):
         return None
 
@@ -65,7 +82,6 @@ async def apply_fix(fix_plan: dict, base_branch: str = "main") -> Optional[str]:
         new_content = file_change["new_content"]
         await update_file(path, new_content, fix_plan["commit_message"], branch_name)
 
-    # Create PR
     pr = await create_pull_request(
         title=fix_plan["pr_title"],
         body=fix_plan["pr_body"],

@@ -1,0 +1,44 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      canary:
+        description: 'Canary percentage (for production)'
+        required: false
+        default: '0'
+        type: string
+
+jobs:
+  deploy:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Simulate deployment
+        run: |
+          Write-Host "Deploying to environment: ${{ github.event.inputs.environment }}"
+          if ("${{ github.event.inputs.canary }}" -ne "0") {
+            Write-Host "Canary deployment: ${{ github.event.inputs.canary }}%"
+          } else {
+            Write-Host "Full deployment"
+          }
+          # Add your actual deployment commands here.
+          # Example for Azure: az deployment group create ...
+          # Example for AWS: aws cloudformation deploy ...
+          Write-Host "Deployment simulation complete."
+        shell: pwsh
+
+      - name: Record deployment
+        run: |
+          Write-Host "Deployment to ${{ github.event.inputs.environment }} finished."
+        shell: pwsh
