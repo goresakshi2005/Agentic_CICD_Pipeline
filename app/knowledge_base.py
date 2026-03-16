@@ -1,31 +1,28 @@
+# app/knowledge_base.py
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.schema import Document
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document        # <-- updated
 from app.config import GEMINI_API_KEY
 from app.database import SessionLocal, FixKnowledge
 import os
-import json
 
 embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
 VECTOR_STORE_PATH = "faiss_index"
 
 def get_vector_store():
     if os.path.exists(VECTOR_STORE_PATH):
-        return FAISS.load_local(VECTOR_STORE_PATH, embeddings)
+        return FAISS.load_local(VECTOR_STORE_PATH, embeddings, allow_dangerous_deserialization=True)  # <-- added parameter
     else:
-        # Create with a dummy doc (will be overwritten)
         return FAISS.from_texts(["Placeholder"], embeddings)
 
 def add_fix_to_knowledge(problem: str, solution: str, success: bool = True):
-    # Add to vector store
     vectorstore = get_vector_store()
     doc = Document(page_content=f"Problem: {problem}\nSolution: {solution}", metadata={"success": success})
     vectorstore.add_documents([doc])
     vectorstore.save_local(VECTOR_STORE_PATH)
 
-    # Also store in SQL for tracking success rate
     db = SessionLocal()
-    sig = problem[:255]  # simple signature
+    sig = problem[:255]
     existing = db.query(FixKnowledge).filter_by(problem_signature=sig).first()
     if existing:
         existing.success_count += 1 if success else 0
