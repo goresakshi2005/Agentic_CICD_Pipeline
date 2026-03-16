@@ -1,14 +1,15 @@
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate
-from langchain.schema import HumanMessage
 from app.config import GEMINI_API_KEY
 from app.github_client import get_file_content, create_branch, update_file, create_pull_request
-from app.knowledge_base import add_fix_to_knowledge
 import json
 import time
 from typing import Optional
 
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=GEMINI_API_KEY, temperature=0.2)
+from langchain_core.prompts import PromptTemplate
+from langchain_core.messages import HumanMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from app.knowledge_base import search_similar_problems, add_fix_to_knowledge
+
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY, temperature=0.2)
 
 repair_prompt = PromptTemplate(
     input_variables=["root_cause", "fix_type", "details", "repo_files", "past_fixes"],
@@ -89,5 +90,8 @@ async def apply_fix(fix_plan: dict, base_branch: str = "main") -> Optional[str]:
         base=base_branch
     )
     if pr:
+        # Record in knowledge base (optional: you may want to wait until PR is merged)
+        # For now, we'll add immediately assuming the fix is good.
+        add_fix_to_knowledge(diagnosis["root_cause"], fix_plan.get("pr_body", ""), success=True)
         return pr["html_url"]
     return None

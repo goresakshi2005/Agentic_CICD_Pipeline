@@ -11,5 +11,5 @@ sqlalchemy
 alembic
 slack-sdk
 junitparser
-safety  # optional security scanning
+safety
 pytest
