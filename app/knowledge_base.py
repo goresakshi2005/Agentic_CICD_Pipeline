@@ -6,7 +6,7 @@ from app.config import GEMINI_API_KEY
 from app.database import SessionLocal, FixKnowledge
 import os
 
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-004", google_api_key=GEMINI_API_KEY)
+embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=GEMINI_API_KEY)
 VECTOR_STORE_PATH = "faiss_index"
 
 def get_vector_store():
