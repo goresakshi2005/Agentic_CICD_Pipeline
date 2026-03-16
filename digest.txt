@@ -1,6 +1,7 @@
 Directory structure:
 └── agentic-cicd/
     ├── README.md
+    ├── app.db
     ├── requirements.txt
     ├── app/
     │   ├── __init__.py
@@ -10,6 +11,7 @@ Directory structure:
     │   ├── knowledge_base.py
     │   ├── main.py
     │   ├── models.py
+    │   ├── services.py
     │   ├── utils.py
     │   └── agents/
     │       ├── __init__.py
@@ -19,6 +21,8 @@ Directory structure:
     │       ├── orchestrator.py
     │       ├── repair.py
     │       └── security.py
+    ├── tests/
+    │   └── test_dummy.py
     └── .github/
         └── workflows/
             ├── ci.yaml
@@ -31,6 +35,12 @@ FILE: README.md
 
 
 ================================================
+FILE: app.db
+================================================
+[Non-text file]
+
+
+================================================
 FILE: requirements.txt
 ================================================
 fastapi
@@ -38,6 +48,7 @@ uvicorn
 python-dotenv
 httpx
 langchain
+langchain-community
 langchain-google-genai
 faiss-cpu
 pydantic
@@ -46,7 +57,7 @@ sqlalchemy
 alembic
 slack-sdk
 junitparser
-safety  # optional security scanning
+safety
 pytest
 
 
@@ -116,14 +127,97 @@ Base.metadata.create_all(bind=engine)
 ================================================
 FILE: app/github_client.py
 ================================================
-# ... (keep existing methods) ...
+# app/github_client.py
+import httpx
+import base64
+import io
+import zipfile
+from junitparser import JUnitXml
+from typing import Optional, Dict, Any, List
+from app.config import GITHUB_TOKEN, GITHUB_REPO
 
-async def get_test_results(run_id: int) -> Optional[str]:
-    """Download and parse test report (assuming JUnit XML is uploaded as artifact)."""
-    # GitHub doesn't store test reports directly; we'd need to download from artifacts.
-    # Simplified: assume logs contain test output.
-    logs = await get_workflow_logs(run_id)
-    return logs  # for now
+GITHUB_API_BASE = "https://api.github.com"
+HEADERS = {
+    "Authorization": f"token {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github.v3+json"
+}
+
+# ---------- Existing functions (keep them) ----------
+async def get_workflow_run(run_id: int) -> Optional[Dict[str, Any]]:
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/runs/{run_id}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=HEADERS)
+        if resp.status_code == 200:
+            return resp.json()
+    return None
+
+async def get_workflow_logs(run_id: int) -> Optional[str]:
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/runs/{run_id}/logs"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=HEADERS, follow_redirects=True)
+        if resp.status_code == 200:
+            return resp.text
+    return None
+
+async def get_commit_details(commit_sha: str) -> Optional[Dict[str, Any]]:
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/commits/{commit_sha}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=HEADERS)
+        if resp.status_code == 200:
+            return resp.json()
+    return None
+
+async def create_pull_request(title: str, body: str, head: str, base: str = "main") -> Optional[Dict[str, Any]]:
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/pulls"
+    data = {"title": title, "body": body, "head": head, "base": base}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, json=data, headers=HEADERS)
+        if resp.status_code == 201:
+            return resp.json()
+    return None
+
+async def get_file_content(path: str, ref: str = "main") -> Optional[str]:
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/contents/{path}?ref={ref}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=HEADERS)
+        if resp.status_code == 200:
+            data = resp.json()
+            return base64.b64decode(data["content"]).decode("utf-8")
+    return None
+
+async def create_branch(branch_name: str, from_branch: str = "main") -> bool:
+    # Get SHA of base branch
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/git/ref/heads/{from_branch}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=HEADERS)
+        if resp.status_code != 200:
+            return False
+        sha = resp.json()["object"]["sha"]
+
+    # Create new branch
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/git/refs"
+    data = {"ref": f"refs/heads/{branch_name}", "sha": sha}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, json=data, headers=HEADERS)
+        return resp.status_code == 201
+
+async def update_file(path: str, content: str, commit_message: str, branch: str) -> bool:
+    # Get current file's SHA if exists
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/contents/{path}?ref={branch}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=HEADERS)
+        sha = resp.json()["sha"] if resp.status_code == 200 else None
+
+    content_bytes = content.encode("utf-8")
+    content_b64 = base64.b64encode(content_bytes).decode("utf-8")
+    data = {"message": commit_message, "content": content_b64, "branch": branch}
+    if sha:
+        data["sha"] = sha
+
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/contents/{path}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.put(url, json=data, headers=HEADERS)
+        return resp.status_code in (200, 201)
 
 async def trigger_workflow_dispatch(workflow_id: str, ref: str = "main", inputs: dict = None):
     url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/workflows/{workflow_id}/dispatches"
@@ -140,7 +234,9 @@ async def get_deployment_status(deployment_id: int) -> dict:
         resp = await client.get(url, headers=HEADERS)
         return resp.json() if resp.status_code == 200 else {}
 
-async def list_workflow_runs(status: str = None, per_page: int = 30):
+# ---------- NEW functions needed for monitoring and test artifacts ----------
+async def list_workflow_runs(status: str = None, per_page: int = 30) -> List[Dict[str, Any]]:
+    """List workflow runs, optionally filtered by status."""
     url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/runs"
     params = {"per_page": per_page}
     if status:
@@ -151,38 +247,91 @@ async def list_workflow_runs(status: str = None, per_page: int = 30):
             return resp.json()["workflow_runs"]
     return []
 
+async def list_artifacts(run_id: int) -> List[Dict[str, Any]]:
+    """List artifacts for a workflow run."""
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/runs/{run_id}/artifacts"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=HEADERS)
+        if resp.status_code == 200:
+            return resp.json().get("artifacts", [])
+    return []
+
+async def download_artifact(artifact_url: str) -> Optional[bytes]:
+    """Download an artifact zip."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(artifact_url, headers=HEADERS, follow_redirects=True)
+        if resp.status_code == 200:
+            return resp.content
+    return None
+
+async def get_test_results(run_id: int) -> str:
+    """Attempt to download and parse JUnit XML from artifacts."""
+    artifacts = await list_artifacts(run_id)
+    # Look for an artifact containing test results (common names)
+    test_artifact = None
+    for art in artifacts:
+        name = art["name"].lower()
+        if "test" in name or "junit" in name or "report" in name:
+            test_artifact = art
+            break
+    if not test_artifact:
+        return "No test artifact found."
+
+    archive_url = test_artifact["archive_download_url"]
+    data = await download_artifact(archive_url)
+    if not data:
+        return "Failed to download artifact."
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            xml_files = [f for f in z.namelist() if f.endswith(".xml")]
+            if not xml_files:
+                return "No XML file in artifact."
+            with z.open(xml_files[0]) as f:
+                content = f.read().decode("utf-8")
+                # Parse with junitparser to extract failures
+                xml = JUnitXml.fromstring(content)
+                failures = []
+                for suite in xml:
+                    for case in suite:
+                        if case.result and case.result.type == "failure":
+                            failures.append(f"{case.name}: {case.result.message}")
+                if failures:
+                    return "Test failures:\n" + "\n".join(failures)
+                else:
+                    return "Test report found, but no failures."
+    except Exception as e:
+        return f"Error parsing test artifact: {e}"
+
 
 ================================================
 FILE: app/knowledge_base.py
 ================================================
+# app/knowledge_base.py
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.schema import Document
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document        # <-- updated
 from app.config import GEMINI_API_KEY
 from app.database import SessionLocal, FixKnowledge
 import os
-import json
 
 embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
 VECTOR_STORE_PATH = "faiss_index"
 
 def get_vector_store():
     if os.path.exists(VECTOR_STORE_PATH):
-        return FAISS.load_local(VECTOR_STORE_PATH, embeddings)
+        return FAISS.load_local(VECTOR_STORE_PATH, embeddings, allow_dangerous_deserialization=True)  # <-- added parameter
     else:
-        # Create with a dummy doc (will be overwritten)
         return FAISS.from_texts(["Placeholder"], embeddings)
 
 def add_fix_to_knowledge(problem: str, solution: str, success: bool = True):
-    # Add to vector store
     vectorstore = get_vector_store()
     doc = Document(page_content=f"Problem: {problem}\nSolution: {solution}", metadata={"success": success})
     vectorstore.add_documents([doc])
     vectorstore.save_local(VECTOR_STORE_PATH)
 
-    # Also store in SQL for tracking success rate
     db = SessionLocal()
-    sig = problem[:255]  # simple signature
+    sig = problem[:255]
     existing = db.query(FixKnowledge).filter_by(problem_signature=sig).first()
     if existing:
         existing.success_count += 1 if success else 0
@@ -200,13 +349,15 @@ def search_similar_problems(problem: str, k: int = 3):
 ================================================
 FILE: app/main.py
 ================================================
+# app/main.py
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from app import github_client
-from app.agents import monitor, diagnosis, repair, governance, orchestrator, security
+from app.agents import monitor   # keep monitor import for startup
+from app.services import process_failed_run   # new
 from app.models import ApprovalRequest
 from app.database import SessionLocal, PipelineRun
 import logging
-import json
+import asyncio
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
@@ -231,50 +382,6 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         return {"status": "processing"}
     return {"status": "ignored"}
 
-async def process_failed_run(run_data: dict):
-    run_id = run_data["id"]
-    commit_sha = run_data.get("head_sha")
-    if not commit_sha:
-        logger.error("No commit SHA")
-        return
-
-    # Save to DB
-    db = SessionLocal()
-    db_run = PipelineRun(run_id=run_id, status=run_data["status"], conclusion=run_data["conclusion"], commit_sha=commit_sha, branch=run_data.get("head_branch"))
-    db.add(db_run)
-    db.commit()
-
-    logs = await github_client.get_workflow_logs(run_id)
-    if not logs:
-        logger.error("No logs")
-        return
-
-    diag = await diagnosis.diagnose_failure(run_id, commit_sha, logs)
-    logger.info(f"Diagnosis: {diag}")
-
-    # Optionally run security scan
-    sec_issues = await security.scan_for_secrets()
-    if sec_issues.get("vulnerabilities"):
-        diag["security_issues"] = sec_issues
-        diag["requires_approval"] = True
-
-    fix_plan = await repair.generate_fix(diag)
-    logger.info(f"Fix plan: {fix_plan}")
-
-    # Update DB
-    db_run.diagnosis = diag
-    db_run.fix_plan = fix_plan
-    db.commit()
-
-    if await governance.requires_human_approval(diag, run_data):
-        await governance.request_approval(run_id, diag, fix_plan)
-    else:
-        pr_url = await repair.apply_fix(fix_plan)
-        if pr_url:
-            logger.info(f"Created PR: {pr_url}")
-            # Optionally trigger canary after PR merge (would need webhook for pull_request)
-        db.close()
-
 @app.post("/approve")
 async def approve_action(req: ApprovalRequest):
     db = SessionLocal()
@@ -282,17 +389,17 @@ async def approve_action(req: ApprovalRequest):
     if not run:
         raise HTTPException(404, "Run not found")
 
+    pr_url = None
     if req.approved:
-        pr_url = await repair.apply_fix(run.fix_plan)
+        # Re-use repair.apply_fix with the stored fix_plan
+        from app.agents.repair import apply_fix
+        pr_url = await apply_fix(run.fix_plan)
         run.approval_status = "approved"
-        if pr_url:
-            # Could also trigger deployment after PR merge
-            pass
     else:
         run.approval_status = "rejected"
     db.commit()
     db.close()
-    return {"status": "approved" if req.approved else "rejected", "pr_url": pr_url if req.approved else None}
+    return {"status": "approved" if req.approved else "rejected", "pr_url": pr_url}
 
 @app.get("/health")
 async def health():
@@ -318,6 +425,71 @@ class ApprovalRequest(BaseModel):
 
 
 ================================================
+FILE: app/services.py
+================================================
+# app/services.py
+import logging
+from app import github_client
+from app.agents import diagnosis, repair, governance, security
+from app.database import SessionLocal, PipelineRun
+
+logger = logging.getLogger(__name__)
+
+async def process_failed_run(run_data: dict):
+    run_id = run_data["id"]
+    commit_sha = run_data.get("head_sha")
+    if not commit_sha:
+        logger.error("No commit SHA")
+        return
+
+    db = SessionLocal()
+    try:
+        db_run = PipelineRun(
+            run_id=run_id,
+            status=run_data["status"],
+            conclusion=run_data["conclusion"],
+            commit_sha=commit_sha,
+            branch=run_data.get("head_branch")
+        )
+        db.add(db_run)
+        db.commit()
+
+        logs = await github_client.get_workflow_logs(run_id)
+        if not logs:
+            logger.error("No logs")
+            return
+
+        # Get test artifacts (if any)
+        test_output = await github_client.get_test_results(run_id)
+
+        diag = await diagnosis.diagnose_failure(run_id, commit_sha, logs, test_output)
+        logger.info(f"Diagnosis: {diag}")
+
+        # Security scan (async)
+        sec_issues = await security.scan_for_secrets_async()
+        if sec_issues and sec_issues.get("vulnerabilities"):
+            diag["security_issues"] = sec_issues
+            diag["requires_approval"] = True
+
+        fix_plan = await repair.generate_fix(diag)
+        logger.info(f"Fix plan: {fix_plan}")
+
+        db_run.diagnosis = diag
+        db_run.fix_plan = fix_plan
+        db.commit()
+
+        if await governance.requires_human_approval(diag, run_data):
+            await governance.request_approval(run_id, diag, fix_plan)
+        else:
+            pr_url = await repair.apply_fix(fix_plan)
+            if pr_url:
+                logger.info(f"Created PR: {pr_url}")
+                # Optionally add to knowledge base after PR merge (requires webhook)
+    finally:
+        db.close()
+
+
+================================================
 FILE: app/utils.py
 ================================================
 
@@ -332,14 +504,15 @@ FILE: app/agents/__init__.py
 ================================================
 FILE: app/agents/diagnosis.py
 ================================================
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate
-from langchain.schema import HumanMessage
 from app.config import GEMINI_API_KEY
 from app.knowledge_base import search_similar_problems
 from app.github_client import get_commit_details, get_test_results
 import json
 import re
+
+from langchain_core.prompts import PromptTemplate
+from langchain_core.messages import HumanMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=GEMINI_API_KEY, temperature=0)
 
@@ -366,17 +539,14 @@ Provide a JSON output with:
 """
 )
 
-async def diagnose_failure(run_id: int, commit_sha: str, logs: str) -> dict:
-    # Get commit details
+# app/agents/diagnosis.py (modify diagnose_failure signature and usage)
+
+async def diagnose_failure(run_id: int, commit_sha: str, logs: str, test_output: str = "") -> dict:
     commit_data = await get_commit_details(commit_sha)
     commit_message = commit_data.get("commit", {}).get("message", "")
     files = commit_data.get("files", [])
     diff_text = "\n".join([f"{f['filename']}: {f['status']}" for f in files])
 
-    # Get test output (if any) - from logs or separate artifact
-    test_output = await extract_test_output(run_id, logs)
-
-    # Search knowledge base
     similar = search_similar_problems(logs[:500])
     similar_text = "\n".join(similar) if similar else "No similar past issues."
 
@@ -388,11 +558,6 @@ async def diagnose_failure(run_id: int, commit_sha: str, logs: str) -> dict:
         similar_issues=similar_text
     )
     response = llm.invoke([HumanMessage(content=prompt)])
-    try:
-        result = json.loads(response.content)
-    except:
-        result = {"root_cause": "Unknown", "confidence": 0.5, "suggested_fix_type": "other", "details": response.content, "requires_approval": True}
-    return result
 
 async def extract_test_output(run_id: int, logs: str) -> str:
     # Simple extraction: look for lines between "test session starts" and a summary
@@ -405,26 +570,15 @@ async def extract_test_output(run_id: int, logs: str) -> str:
 ================================================
 FILE: app/agents/governance.py
 ================================================
-import os
-from slack_sdk.web.async_client import AsyncWebClient
+# app/agents/governance.py
+import logging
 from app.config import SLACK_TOKEN, SLACK_CHANNEL
 
-slack_client = AsyncWebClient(token=SLACK_TOKEN) if SLACK_TOKEN else None
+logger = logging.getLogger(__name__)
 
-async def requires_human_approval(diagnosis: dict, run_data: dict) -> bool:
-    # Risk factors: deployment to prod, changes to critical files, low confidence, security issues
-    branch = run_data.get("head_branch")
-    if branch == "main" or branch == "production":
-        return True
-    if diagnosis.get("confidence", 1) < 0.7:
-        return True
-    if diagnosis.get("suggested_fix_type") in ["config_error", "dependency"]:
-        # Could be risky if it's a security patch
-        pass
-    return False
+# ... (keep requires_human_approval as before)
 
 async def request_approval(run_id: int, diagnosis: dict, fix_plan: dict):
-    # Store in DB
     from app.database import SessionLocal, PipelineRun
     db = SessionLocal()
     run = db.query(PipelineRun).filter_by(run_id=run_id).first()
@@ -433,73 +587,47 @@ async def request_approval(run_id: int, diagnosis: dict, fix_plan: dict):
         db.commit()
     db.close()
 
-    # Send Slack message
-    if slack_client:
-        blocks = [
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*Approval Required for Run {run_id}*"}
-            },
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*Root Cause:* {diagnosis.get('root_cause')}"}
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Approve"},
-                        "style": "primary",
-                        "value": f"approve_{run_id}",
-                        "action_id": "approve"
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Reject"},
-                        "style": "danger",
-                        "value": f"reject_{run_id}",
-                        "action_id": "reject"
-                    }
-                ]
-            }
-        ]
-        await slack_client.chat_postMessage(channel=SLACK_CHANNEL, blocks=blocks)
+    if SLACK_TOKEN:
+        try:
+            from slack_sdk.web.async_client import AsyncWebClient
+            slack_client = AsyncWebClient(token=SLACK_TOKEN)
+            blocks = [ ... ]  # same as before
+            await slack_client.chat_postMessage(channel=SLACK_CHANNEL, blocks=blocks)
+        except Exception as e:
+            logger.error(f"Slack notification failed: {e}")
+            # Fallback: just log
+            logger.info(f"Approval required for run {run_id}. Use POST /approve with run_id={run_id}")
+    else:
+        logger.info(f"Approval required for run {run_id}. Use POST /approve with run_id={run_id}")
 
 
 ================================================
 FILE: app/agents/monitor.py
 ================================================
+# app/agents/monitor.py
 import asyncio
-from app.github_client import get_workflow_run
+from app.github_client import list_workflow_runs
 from app.database import SessionLocal, PipelineRun
-from app.agents.diagnosis import diagnose_failure
-from app.main import process_failed_run  # careful with circular imports; better to move logic to a service
+from app.services import process_failed_run   # <-- import from services
 import logging
 
 logger = logging.getLogger(__name__)
 
 async def monitor_recent_runs():
-    """Periodically check for recent failed runs not yet processed."""
     while True:
         try:
-            # Use GitHub API to list recent runs (simplified: get last 10)
-            # This requires a new github_client method; we'll add it.
-            from app.github_client import list_workflow_runs
             runs = await list_workflow_runs(status="completed", per_page=10)
             db = SessionLocal()
             for run in runs:
                 run_id = run["id"]
                 existing = db.query(PipelineRun).filter_by(run_id=run_id).first()
                 if not existing and run["conclusion"] == "failure":
-                    # Process this run
                     logger.info(f"Monitor found unprocessed failed run {run_id}")
-                    # Schedule processing (we can use asyncio.create_task)
                     asyncio.create_task(process_failed_run(run))
             db.close()
         except Exception as e:
             logger.error(f"Monitor error: {e}")
-        await asyncio.sleep(60)  # poll every minute
+        await asyncio.sleep(60)
 
 
 ================================================
@@ -529,17 +657,18 @@ async def canary_deploy(environment: str = "production", canary_percent: int = 1
 ================================================
 FILE: app/agents/repair.py
 ================================================
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate
-from langchain.schema import HumanMessage
 from app.config import GEMINI_API_KEY
 from app.github_client import get_file_content, create_branch, update_file, create_pull_request
-from app.knowledge_base import add_fix_to_knowledge
 import json
 import time
 from typing import Optional
 
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=GEMINI_API_KEY, temperature=0.2)
+from langchain_core.prompts import PromptTemplate
+from langchain_core.messages import HumanMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from app.knowledge_base import search_similar_problems, add_fix_to_knowledge
+
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY, temperature=0.2)
 
 repair_prompt = PromptTemplate(
     input_variables=["root_cause", "fix_type", "details", "repo_files", "past_fixes"],
@@ -620,6 +749,9 @@ async def apply_fix(fix_plan: dict, base_branch: str = "main") -> Optional[str]:
         base=base_branch
     )
     if pr:
+        # Record in knowledge base (optional: you may want to wait until PR is merged)
+        # For now, we'll add immediately assuming the fix is good.
+        add_fix_to_knowledge(diagnosis["root_cause"], fix_plan.get("pr_body", ""), success=True)
         return pr["html_url"]
     return None
 
@@ -627,17 +759,31 @@ async def apply_fix(fix_plan: dict, base_branch: str = "main") -> Optional[str]:
 ================================================
 FILE: app/agents/security.py
 ================================================
+# app/agents/security.py
 import subprocess
 import json
+import asyncio
 
-async def scan_for_secrets(branch: str = "main"):
-    """Use truffleHog or similar; here we simulate with safety."""
-    # Example: run safety check on requirements.txt
-    result = subprocess.run(["safety", "check", "--json"], capture_output=True, text=True)
+async def scan_for_secrets_async(branch: str = "main"):
+    """Run safety check in a thread."""
+    loop = asyncio.get_event_loop()
+    # safety check --json
+    result = await loop.run_in_executor(
+        None,
+        lambda: subprocess.run(["safety", "check", "--json"], capture_output=True, text=True)
+    )
     try:
         return json.loads(result.stdout)
     except:
         return {"vulnerabilities": []}
+
+
+================================================
+FILE: tests/test_dummy.py
+================================================
+# tests/test_dummy.py
+def test_fail():
+    assert False, "This test is meant to fail"
 
 
 ================================================
