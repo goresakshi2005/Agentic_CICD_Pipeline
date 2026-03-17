@@ -22,7 +22,7 @@ Directory structure:
     │       ├── repair.py
     │       └── security.py
     ├── tests/
-    │   └── test_dummy.py
+    │   └── test3.py
     └── .github/
         └── workflows/
             ├── ci.yaml
@@ -315,7 +315,7 @@ from app.config import GEMINI_API_KEY
 from app.database import SessionLocal, FixKnowledge
 import os
 
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-004", google_api_key=GEMINI_API_KEY)
+embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=GEMINI_API_KEY)
 VECTOR_STORE_PATH = "faiss_index"
 
 def get_vector_store():
@@ -779,7 +779,7 @@ async def scan_for_secrets_async(branch: str = "main"):
 
 
 ================================================
-FILE: tests/test_dummy.py
+FILE: tests/test3.py
 ================================================
 # tests/test_dummy.py
 def test_fail():

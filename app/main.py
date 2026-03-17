@@ -8,6 +8,8 @@ from app.database import SessionLocal, PipelineRun
 import logging
 import asyncio
 
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 app = FastAPI()
 logger = logging.getLogger(__name__)
 
